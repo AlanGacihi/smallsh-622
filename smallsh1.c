@@ -1,444 +1,614 @@
-/* Martin Barker 2017
-*	 This program executes a simple shell in c
-* The shell can run background proccesses, command line arguments, and
-* perform I/O redirection.
-* The shell uses fork(), exec(), and waitpid() to execute commands.
-*/
-
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <signal.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
 
-int pidarray[1000];
-int pidarraycount;
-int numpids;
-int exitstatus;
-int lastforeground;
-int pidskilled;
-int skip;
-int ignored;
-static volatile int keeprunning = 1;
+/*GLOBAL VARIABLES*/
+int pipe_count=0, fd;
+static char* args[512];
+char *history_file;
+char input_buffer[1024];
+char *cmd_exec[100];
+int flag, len;
+char cwd[1024];
+int flag_pipe=1;
+pid_t pid;
+int no_of_lines;
+int environmment_flag;
+int flag_pipe, flag_without_pipe,  output_redirection, input_redirection;
+int bang_flag;
+int pid, status;
+char history_data[1000][1000];
+char current_directory[1000];
+char ret_file[3000];
+char his_var[2000];
+char *input_redirection_file;
+char *output_redirection_file;
+extern char** environ;
 
-struct LinkedList{
-	int data;
-	struct LinkedList *next;
-};
-typedef struct LinkedList *node;
+/***************************Header Files Used*****************************/
+void clear_variables();
+void fileprocess ();
+void filewrite();
+void bang_execute();
+void environmment();
+void set_environment_variables();
+void change_directory();
+void parent_directory();
+void echo_calling(char *echo_val);
+void history_execute_with_constants();
+static char* skipwhite(char* s);
+void tokenise_commands(char *com_exec);
+void tokenise_redirect_input_output(char *cmd_exec);
+void tokenise_redirect_input(char *cmd_exec);
+void tokenise_redirect_output(char *cmd_exec);
+char* skipcomma(char* str);
+static int split(char *cmd_exec, int, int, int);
+static int command(int, int, int, char *cmd_exec);
+void prompt();
+void sigintHandler(int sig_num);
 
+/*************************************************************************/
+void sigintHandler(int sig_num)
+{
+    signal(SIGINT, sigintHandler);
+    fflush(stdout);
+}
+void clear_variables()
+{
+  fd =0;
+  flag=0;
+  len=0;
+  no_of_lines=0;
+  pipe_count=0;
+  flag_pipe=0;
+  flag_without_pipe=0;
+  output_redirection=0;
+  input_redirection=0;
+  input_buffer[0]='\0';
+  cwd[0] = '\0';
+  pid=0;
+  environmment_flag=0;
+  bang_flag=0;
+}
+  
+void fileprocess ()
+{
+  int fd;
+  history_file=(char *)malloc(100*sizeof(char));
+  strcpy(history_file,current_directory);
+  strcat(history_file, "/");
+  strcat(history_file, "history.txt"); 
+  fd=open(history_file, O_RDONLY|O_CREAT,S_IRUSR|S_IWUSR);
+  int bytes_read=0, i=0, x=0, index=0;
+  char buffer[1], temp_data[1000];
+    do 
+    {
+        bytes_read = read (fd, buffer, sizeof (buffer));
+        for (i=0; i<bytes_read; ++i) 
+                  {
+                    temp_data[index]=buffer[i];
+                    index++;
+                    if(buffer[i]=='\n')
+                        {
+                          temp_data[index-1]='\0';
+                          no_of_lines++; 
+                          index=0;
+                          strcpy(history_data[x], temp_data);
+                          x++;
+                          temp_data[0]='\0';
+                        }
+                  }
+    }
+    while (bytes_read == sizeof (buffer)); 
+    close (fd); 
+}
+void filewrite()
+{
+  
+  int fd_out,ret_write,str_len=0;
+  char input_data[2000];
+  no_of_lines++;
+  char no[10];
+  sprintf (no, "%d", no_of_lines ); 
+  strcpy(input_data, " ");
+  strcat(input_data, no);
+  strcat(input_data, " ");
+  strcat(input_data, input_buffer);
 
-//reads input of a string of unknown lengh and returns char array
-char *inputString(FILE* fp, size_t size){
-	char *str;
-	int ch;
-	size_t len = 0;
-	str = realloc(NULL, sizeof(char)*size);
-	if(!str)return str;
-	while(EOF!=(ch=fgetc(fp)) && ch != '\n'){
-		str[len++]=ch;
-		if(len==size){
-			str = realloc(str, sizeof(char)*(size+=16));
-			if(!str)return str;
-		}
-	}
-	str[len++]='\0';
-	return realloc(str, sizeof(char)*len);
+  str_len = strlen(input_data);
+  fd_out=open(history_file,O_WRONLY|O_APPEND|O_CREAT,S_IRUSR|S_IWUSR);
+  len=strlen(input_buffer);
+  ret_write=write(fd_out,input_data,str_len);
+  if(ret_write<0) 
+        {
+          printf("Error in writing file\n");
+          return;
+        }
+  close(fd_out);
+
+}
+void bang_execute()
+{
+  char bang_val[1000];
+  char *tokenise_bang[100], *num_ch[10];
+  int i, n=1, num, index=0;
+  i=1;
+  if(input_buffer[i]=='!')
+        {
+           strcpy(bang_val, history_data[no_of_lines-1]);
+        }
+  else if(input_buffer[i]=='-')
+    {
+        n=1;
+        num_ch[0]=strtok(input_buffer,"-");
+        while ((num_ch[n]=strtok(NULL,"-"))!=NULL)
+              n++;
+        num_ch[n]=NULL;
+        num = atoi(num_ch[1]);
+
+        index = no_of_lines-num;
+        strcpy(bang_val, history_data[index]);
+              
+    }
+  else 
+    {
+      num_ch[0]=strtok(input_buffer,"!");
+      num = atoi(num_ch[0]);
+      strcpy(bang_val, history_data[num-1]);
+    }
+  tokenise_bang[0]=strtok(bang_val," ");
+  while ((tokenise_bang[n]=strtok(NULL,""))!=NULL)
+              n++;
+  tokenise_bang[n]=NULL;
+  strcpy(bang_val, tokenise_bang[1]);
+  printf("%s\n", bang_val );
+  strcpy(input_buffer, bang_val);
+
+    
 }
 
-//catches ctrl-c process termination
-void myhandler(int dummy) {
-	printf("terminated by signal %d\n", dummy);
+void environmment()
+{
+  int i =1, index=0;
+  char env_val[1000], *value;
+  while(args[1][i]!='\0')
+              {
+                   env_val[index]=args[1][i];
+                   index++;
+                    i++;
+              }
+  env_val[index]='\0';
+  value=getenv(env_val);
+
+  if(!value)
+      printf("\n");
+  else printf("%s\n", value);
 }
 
-//catches ctrl-z termination, switches over to background mode/normal mode
-void myzhandler(int dummy){
-	if(ignored == 0){
-		printf("Entering foreground-only mode (& is now ignored)\n");
-		ignored = 1;
-	}else if(ignored == 1){
-		printf("Exiting foreground-only mode\n");
-		ignored = 0;
-	}
+void set_environment_variables()
+{  
+int n=1;
+char *left_right[100];
+if(args[1]==NULL)
+      {
+        char** env;
+          for (env = environ; *env != 0; env++)
+          {
+            char* value = *env;
+            printf("declare -x %s\n", value);    
+          }  
+         return; 
+      }
+left_right[0]=strtok(args[1],"=");
+while ((left_right[n]=strtok(NULL,"="))!=NULL)
+      n++;
+left_right[n]=NULL;
+setenv(left_right[0], left_right[1], 0);
 }
 
-int main(){
-	//handles sending ctrl-z ctrl-c
-	ignored = 0;
-	struct sigaction sigih;
-	sigih.sa_handler = myhandler;
-	sigemptyset(&sigih.sa_mask);
-	sigih.sa_flags = 0;
-	sigaction(SIGINT, &sigih, NULL);
-	sigih.sa_handler = myzhandler;
-	sigemptyset(&sigih.sa_mask);
-	sigih.sa_flags = 0;
-	sigaction(SIGTSTP, &sigih, NULL);
+
+ 
+void change_directory()
+{
+char *h="/home";   
+if(args[1]==NULL)
+        chdir(h);
+else if ((strcmp(args[1], "~")==0) || (strcmp(args[1], "~/")==0))
+        chdir(h);
+else if(chdir(args[1])<0)
+    printf("bash: cd: %s: No such file or directory\n", args[1]);
+
+}
+
+void parent_directory()
+{
+if (getcwd(cwd, sizeof(cwd)) != NULL)
+        {
+         printf("%s\n", cwd );
+        }
+else
+       perror("getcwd() error");
 
 
-	//will keep track of background proccesses
-	pidskilled = 0;
-	pidarraycount = 0;
-	char *line;
-	char *backup;
-	int exitv = 0;
-	int exitsignal = 0;
-	int terminatedby = 0;
-/*
- *	while loop for user input
- */
-	while(exitv == 0){
-		skip = 0;
+}
+void echo_calling(char *echo_val)
+{
+  int i=0, index=0;
+  environmment_flag=0;
+  char new_args[1024],env_val[1000], *str[10];
+  str[0]=strtok(echo_val," ");
+  str[1]=strtok(NULL, "");
+  strcpy(env_val, args[1]);
+  if(str[1]==NULL)
+         {
+          printf("\n");
+          return;
+         } 
+  if (strchr(str[1], '$')) 
+                  {
+                  environmment_flag=1;
+                  }
+  
+  memset(new_args, '\0', sizeof(new_args));
+  i=0; 
+  while(str[1][i]!='\0')
+    {
+      if(str[1][i]=='"')
+      {
+      index=0;     
+      while(str[1][i]!='\0')
+          {
+          if(str[1][i]!='"')
+                {
+                new_args[index]=str[1][i];
+                 flag=1;
+                index++;
+                }
+          i++;
+          }             
+      }
+      else if(str[1][i]==39)
+      {
+      index=0;
+      while(str[1][i]!='\0')
+          {
+          if(str[1][i]!=39)
+                {
+                new_args[index]=str[1][i];
+                 flag=1;
+                index++;
+                }
+          i++;
+          }               
+      }
+      else if(str[1][i]!='"')
+        {
+          new_args[index]=str[1][i];
+          index++;
+          i++;
+        }
+      else i++;    
+    }
 
-		//check pidarray, if proccess has been terminated print PID
-		int j = 0;
-		int status2;
 
-		/*
- 		*	if there are pids in pidarray, loop through to print out any ones that have exited
- 		*/
-		if(numpids > 0){
-			for(j = 0; j < pidarraycount; j++){
-				pid_t result = waitpid(pidarray[j], &status2, WNOHANG);
-				if(pidarray[j] != 0){
-					if(result != 0){
-						//proccess is done, kill and remove from array
-						printf("background pid %d is done: exit value %d\n", result, status2);
-						kill(pidarray[j], SIGKILL);
-						pidskilled++;
-						pidarray[j] = 0;
-					}
+new_args[index]='\0';
+if((strcmp(args[1], new_args)==0)&&(environmment_flag==0))
+    printf("%s\n", new_args);
+else {
+     strcpy(args[1], new_args);
+      if(environmment_flag==1)
+                {
+                environmment();
+                }
+      else if(environmment_flag==0)
+                {
+                  printf("%s\n", new_args ); 
+                }
+    }  
+}
+void history_execute_with_constants()
+{
+  int num, i, start_index;
+  if(bang_flag==1)
+        {
+         for(i=0; i<no_of_lines; i++)
+            printf("%s\n", history_data[i] ); 
+        }
+  else if(args[1]==NULL)
+      {
+        for(i=0; i<no_of_lines-1; i++)
+            printf("%s\n", history_data[i] );
+        printf(" %d %s\n", no_of_lines, his_var );
+      }
+  else
+      {
+        if(args[1]!=NULL)
+        num = atoi(args[1]);
+        if(num>no_of_lines) 
+        {
+          for(i=0; i<no_of_lines-1; i++)
+            printf("%s\n", history_data[i] );
+          printf(" %d %s\n", no_of_lines, his_var );
+        }
+        start_index=no_of_lines-num;
+        for(i=start_index; i<no_of_lines-1; i++)
+            printf("%s\n", history_data[i] );
+          printf(" %d %s\n", no_of_lines, his_var );
+      } 
 
-				}
-			}
-		}
-		printf(":");   //start of shell
-/*
- *  sends stdin to function where it returns the input as a char arrayof the correct size
-*/
-		line = inputString(stdin, 10);
-		fflush(stdin);
-		fflush(stdout);
-/*
- * parses line into different things, such as first word, first 6 chars, last letter, etc
- */
-		if(strcmp("exit $", line)==0){
-			exitv++;
-		}
+}
+static char* skipwhite(char* s)
+{
+  while (isspace(*s)) ++s;
+  return s;
+}
+void tokenise_commands(char *com_exec)
+{
+int m=1;
+args[0]=strtok(com_exec," ");       
+while((args[m]=strtok(NULL," "))!=NULL)
+        m++;
+}
+void tokenise_redirect_input_output(char *cmd_exec)
+{
+  char *io_token[100];
+  char *new_cmd_exec1;  
+  new_cmd_exec1=strdup(cmd_exec);
+  int m=1;
+  io_token[0]=strtok(new_cmd_exec1,"<");       
+  while((io_token[m]=strtok(NULL,">"))!=NULL)
+        m++;
+  io_token[1]=skipwhite(io_token[1]);
+  io_token[2]=skipwhite(io_token[2]);
+  input_redirection_file=strdup(io_token[1]);
+  output_redirection_file=strdup(io_token[2]);
+  tokenise_commands(io_token[0]);
+  
+}
+void tokenise_redirect_input(char *cmd_exec)
+{
+  char *i_token[100];
+  char *new_cmd_exec1;  
+  new_cmd_exec1=strdup(cmd_exec);
+  int m=1;
+  i_token[0]=strtok(new_cmd_exec1,"<");       
+  while((i_token[m]=strtok(NULL,"<"))!=NULL)
+        m++;
+  i_token[1]=skipwhite(i_token[1]);
+  input_redirection_file=strdup(i_token[1]);
+  tokenise_commands(i_token[0]);
+}
+void tokenise_redirect_output(char *cmd_exec)
+{
+  char *o_token[100];
+  char *new_cmd_exec1;  
+  new_cmd_exec1=strdup(cmd_exec);
+  int m=1;
+  o_token[0]=strtok(new_cmd_exec1,">");       
+  while((o_token[m]=strtok(NULL,">"))!=NULL)
+          m++;
+  o_token[1]=skipwhite(o_token[1]);
+  output_redirection_file=strdup(o_token[1]); 
+  tokenise_commands(o_token[0]);   
+  
+}
+char* skipcomma(char* str)
+{
+  int i=0, j=0;
+  char temp[1000];
+  while(str[i++]!='\0')
+            {
+              if(str[i-1]!='"')
+                    temp[j++]=str[i-1];
+            }
+        temp[j]='\0';
+        str = strdup(temp);
+  
+  return str;
+}
+static int split(char *cmd_exec, int input, int first, int last)
+{
+    char *new_cmd_exec1;  
+    new_cmd_exec1=strdup(cmd_exec);
+   //else
+      {
+        int m=1;
+        args[0]=strtok(cmd_exec," ");       
+        while((args[m]=strtok(NULL," "))!=NULL)
+              m++;
+        args[m]=NULL;
+        if (args[0] != NULL) 
+            {
 
-		int L1 = strstr(line, "$$")-line;
-		int L2 = (strstr(line, "$$")-line)+1;
+            if (strcmp(args[0], "exit") == 0) 
+                    exit(0);
+            if (strcmp(args[0], "echo") != 0) 
+                    {
+                      cmd_exec = skipcomma(new_cmd_exec1);
+                      int m=1;
+                      args[0]=strtok(cmd_exec," ");       
+                      while((args[m]=strtok(NULL," "))!=NULL)
+                                m++;
+                      args[m]=NULL;
 
-		if(L1 > 0 && L2 > 0){
-			line[L1] = '%';
-			line[L2] = 'd';
-			char expandinput[200];
-			sprintf(expandinput, line, getpid());
-			strncpy(line, expandinput, 50);
-		}
+                    }
+            if(strcmp("cd",args[0])==0)
+                    {
+                    change_directory();
+                    return 1;
+                    }
+            else if(strcmp("pwd",args[0])==0)
+                    {
+                    parent_directory();
+                    return 1;
+                    }
+           
+            }
+        }
+    return command(input, first, last, new_cmd_exec1);
+}
 
-//parses line for individual strings / any special chars
-		char firstLetter[1];
-		char temp = line[0];
-		firstLetter[0] = temp;
-		firstLetter[1] = '\0';
-		char firstTwoLetters[2] = "  ";
-		if(strlen(line) >= 2){
-			firstTwoLetters[0] = line[0];
-			firstTwoLetters[1] = line[1];
-			firstTwoLetters[2] = '\0';
-		}
-		char * space;
-		int spaces = 1;
-		char * spaceCount;
-		space=strchr(line, ' ');
-		spaceCount=strchr(line, ' ');
-		char lastletter[2] = "  ";
-		int lastSpaceCount = 0;
-		while (spaceCount!=NULL){
-				spaces++;
-				lastSpaceCount = spaceCount-line;
-				spaceCount=strchr(spaceCount+1, ' ');
-		}
-		lastletter[1] = '\0';
-		memcpy(lastletter, &line[strlen(line)-1], lastSpaceCount);
-		char linearray[spaces+1][200];
-		spaceCount=strchr(line, ' ');
-		spaces = 0;
-		lastSpaceCount = 0;
-		int prev = 0;
-		char indv[1024];
-		while (spaceCount!=NULL){
-			lastSpaceCount = spaceCount-line;
-			indv[1024];
-			memcpy(indv, &line[prev], lastSpaceCount);
-			indv[lastSpaceCount - prev] = '\0';
-			strcpy(linearray[spaces], indv);
-			prev = lastSpaceCount +1;
-			spaces++;
-			spaceCount=strchr(spaceCount+1, ' ');
-		}
-		memcpy(indv, &line[prev], strlen(line));
-		indv[strlen(line) - prev] = '\0';
-		strcpy(linearray[spaces], indv);
-		int i = 0;
-		char *args2[spaces+1];
-		for(i=0; i <= spaces; i++){
-			args2[i] = linearray[i];
-		}
-		args2[spaces+1] = NULL;
-		char firstword[2];
-		if(space-line > 0){
-			firstword[space-line];
-			memcpy(firstword, &line[0], space-line);
-			firstword[space-line] = '\0';
-		}
-		char firstSix[6] = "      ";
-		if(strlen(line) >= 6){
-			memcpy(firstSix, &line[3], strlen(line));
-		}
-/*
- * detects if the user input is a built in command
- */
-		if(strcmp(line, "exit")==0){
-			exitv++;
-		}else if(strcmp(firstTwoLetters, "cd")==0){
-			if(strlen(line) == 2){
-				const char* s = getenv("HOME");
-				chdir(s);
-			}else{
-				char dir[strlen(line)-3];
-				memcpy(dir, &line[3], strlen(line));
-				chdir(dir);
-			}
-		}else if(strcmp(args2[0], "status")==0){
-			if(lastforeground != 1){
-				printf("exit value %d\n", exitstatus);
-			}else{
-				printf("terminated by signal %d\n", terminatedby);
-			}
-		}else if(strcmp(firstLetter, "#")!=0){
 
-//if input = not build in:
-// determine any input / output redirection to be done
-/*
- *	find i_place (where < occurs" and o_place (where > occurs)
- */
 
-			i = 0;
-			int i_place = 0;
-			int o_file = 0;
-			int o_place = 0;
-			int OS_string_end = 0;
-			for(i=0; i<= spaces; i++){
-				if(strcmp(args2[i], "<")==0){
-					i_place = i;
-				}else if(strcmp(args2[i], ">")==0){
-					o_place = i;
-					o_file = i+1;
-				}
-			}
-//creates and fill os_string
-			spaces++;
-			char *OS_string[spaces];
-			i = 0;
-			for(i=0; i < spaces; i++){
-				OS_string[i] = args2[i];
-			}
-			char *command = OS_string[0];
-			char *s;
-			char *t;
-//does i/o redirection if needed
-			int sourceFD = 0;
-			int targetFD = 0;
-			int result = 0;
-			int stat = 0;
-			if(i_place != 0){
+static int command(int input, int first, int last, char *cmd_exec)
+{
+  int mypipefd[2], ret, input_fd, output_fd;
+  ret = pipe(mypipefd);
+  if(ret == -1)
+      {
+        perror("pipe");
+        return 1;
+      }
+  pid = fork();
+ 
+  if (pid == 0) 
+  {
+    if (first==1 && last==0 && input==0) 
+    {
+      dup2( mypipefd[1], 1 );
+    } 
+    else if (first==0 && last==0 && input!=0) 
+    {
+      dup2(input, 0);
+      dup2(mypipefd[1], 1);
+    } 
+    else 
+    {
+      dup2(input, 0);
+    }
+    if (strchr(cmd_exec, '<') && strchr(cmd_exec, '>')) 
+            {
+              input_redirection=1;
+              output_redirection=1;
+              tokenise_redirect_input_output(cmd_exec);
+            }
+   else if (strchr(cmd_exec, '<')) 
+        {
+          input_redirection=1;
+          tokenise_redirect_input(cmd_exec);
+        }
+   else if (strchr(cmd_exec, '>')) 
+        {
+          output_redirection=1;
+          tokenise_redirect_output(cmd_exec);
+        }
+    if(output_redirection == 1)
+                {                    
+                        output_fd= creat(output_redirection_file, 0644);
+                        if (output_fd < 0)
+                          {
+                          fprintf(stderr, "Failed to open %s for writing\n", output_redirection_file);
+                          return(EXIT_FAILURE);
+                          }
+                        dup2(output_fd, 1);
+                        close(output_fd);
+                        output_redirection=0;
+                }
+    if(input_redirection  == 1)
+                  {
+                         input_fd=open(input_redirection_file,O_RDONLY, 0);
+                         if (input_fd < 0)
+                          {
+                          fprintf(stderr, "Failed to open %s for reading\n", input_redirection_file);
+                          return(EXIT_FAILURE);
+                          }
+                        dup2(input_fd, 0);
+                        close(input_fd);
+                        input_redirection=0;
+                  }
+     if (strcmp(args[0], "export") == 0)
+                  {
+                  set_environment_variables();
+                  return 1;
+                  }
+    if (strcmp(args[0], "echo") == 0)
+              {
+              echo_calling(cmd_exec);
+              } 
+    else if (strcmp(args[0], "history") == 0)
+             {
+              history_execute_with_constants();
+              } 
+ 
+    else if(execvp(args[0], args)<0) printf("%s: command not found\n", args[0]);
+              exit(0);
+  }
+  else 
+  {
+     waitpid(pid, 0, 0);  
+   }
+ 
+  if (last == 1)
+    close(mypipefd[0]);
+  if (input != 0) 
+    close(input);
+  close(mypipefd[1]);
+  return mypipefd[0];
 
-				if(access(OS_string[i_place+1], F_OK)!= -1){
-				}else{
-					printf("cannot open %s for input\n", OS_string[i_place+1]);
-					skip = 1;
-				}
+}
+void prompt()
+{
+  char shell[1000];
+   if (getcwd(cwd, sizeof(cwd)) != NULL)
+        {
+          strcpy(shell, "My_shell:");
+          strcat(shell, cwd);
+          strcat(shell, "$ ");
 
-				stat = 1;
-				sourceFD = open(OS_string[i_place+1], O_RDONLY);
-				OS_string_end = i_place;
-				if(o_place != 0){
-					stat = 2;
-					targetFD = open(OS_string[o_place+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-				}
-			}else{
-				if(o_place == 0 && i_place == 0){
-					stat = 3;
-				}else{
-		    	if(o_place != 0){
-						stat = 4;
-			     			targetFD = open(OS_string[o_place+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-					}
-				}
-			}
-/*
- * targetfd and sourcefd have been set depending on if string has input, output, both, or a combination (does not acount for & background proccesses)
- */
-			int size = 0;
-			if(i_place != 0 && o_place != 0){
-				size = i_place;  //input and output
-			}else{
-				if(i_place != 0 && o_place == 0){
-					size = i_place; //input and no output
-				}else if(i_place == 0 && o_place != 0){
-					size = o_place; //only output
-				}else if(i_place == 0 && o_place == 0){
-					size = spaces;
-				}
-			}
-			int background = 0;
+          printf("%s", shell);
+        }
+   else
+       perror("getcwd() error");
 
-/*
- * sets background = 1 if last char in line is &, if it is background command; set input/output redirection to junk file
- */
-			if(strcmp(OS_string[spaces-1], "&")==0){
-				if(ignored == 0){
-					background = 1;
-					numpids = numpids + 1;
-					targetFD = open("junktrashbackground", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-					if(stat == 3 || stat == 4){
-						sourceFD = open("junktrashbackground2", O_WRONLY);
-					}
-				}else if(ignored == 1){
-					background == 0;
-				}
-			}
+}
 
-/*
- * puts what will be executed in exevc command into array called exec_string
- */
-			char *exec_string[size];
-			i = 0;
-			if(ignored == 1){
-				background = 1;
-			}
-			for(i=0; i < size-background; i++){
-				exec_string[i] = OS_string[i];
-			}
-			exec_string[size-background] = NULL;
-			if(ignored == 1){ background = 0; }
-			pid_t spawnpid = -5;
-			int childExitMethod = -5;
-			int ten = 10;
-			result = 0;
-			int backgroundpid = 99;
-			spawnpid = fork();
-			int spaces2 = 0;
-			if(skip == 1){
-				sourceFD = open("/dev/null", O_WRONLY);
-			}
-
-//forks off
-			if(ignored == 1){
-				background == 0;
-			}
-			switch (spawnpid){
-				case -1:
-					perror("Hull Breach!");
-					exit(1);
-					exitsignal = 1;
-					break;
-				case 0:   //child case
-
-				if(background==0){
-					spaces2 = spaces;
-					if(stat == 1){ //only input redirection
-						result = dup2(sourceFD, 0);
-						if(skip == 1){
-
-						}
-						if(result ==-1){
-							perror("source dup2()");
-							exitstatus = 1;
-						}
-					}
-					if(stat == 2){ //both i and o redirection
-						result = dup2(sourceFD, 0);
-						if(result ==-1){
-							perror("source dup2()");
-							exitstatus = 1;
-						}
-						result = dup2(targetFD, 1);
-						if(result ==-1){
-							perror("target dup2()");
-							exitstatus = 1;
-						}
-						OS_string[1] = NULL;
-						if(sourceFD == -1){
-							perror("source open()");
-							exitstatus = 1;
-						}
-						if(targetFD == -1){
-							perror("target open()");
-							exitstatus = 1;
-						}
-					}else if(stat == 3){ //single command
-
-					}else if(stat == 4){ //single output
-						result = dup2(targetFD, 1);
-						if(result ==-1){
-							perror("target dup2()");
-							exitstatus = 1;
-						}
-					}
-			}else if(background == 1){
-						result = dup2(targetFD, 1);
-						if(stat == 3 || stat == 4){
-							result = dup2(sourceFD, 0);
-						}
-
-					}
-/*
- * dup2 i/o redirection is all successfully set now, run command
- */
-					if(skip == 1){
-						execlp("echo", "echo", " ", NULL);
-					}else{
-
-					OS_string[spaces2] = NULL;
-					if(background==1){
-						fclose(stdin);
-						fopen("/dev/null", "r");
-						execvp(exec_string[0], exec_string);
-						exit(1);
-					}else{
-						execvp(exec_string[0], exec_string);
-						exit(1);
-					}
-				}
-					perror("CHILD: exec failure\n");
-					break;
-
-				default: //parent class
-					if(background == 1 ){
-						printf("background pid is %d\n", spawnpid);
-					}else if(background == 0){
-						waitpid(spawnpid, &childExitMethod, 0);
-						kill(spawnpid, SIGKILL);
-					}
-					break;
-			}
-			//outside of fork now
-			//wait for program to close, or dont wait if = background process &
-			if(background == 1){
-				pidarray[pidarraycount] = spawnpid;
-				pidarraycount=pidarraycount+1;
-			}
-			int exitStatus = WEXITSTATUS(childExitMethod);
-			exitstatus = exitStatus;
-			int termSignal = WTERMSIG(childExitMethod);
-
-		}
-	}
+int main()
+{   
+    int status;
+    char ch[2]={"\n"};
+    getcwd(current_directory, sizeof(current_directory));
+    signal(SIGINT, sigintHandler);
+    while (1)
+    {
+      clear_variables();
+      prompt();
+      fgets(input_buffer, 1024, stdin);
+      if(strcmp(input_buffer, ch)==0)
+            {
+              continue;
+            }
+      if(input_buffer[0]!='!')
+            {
+                fileprocess();
+                filewrite(); 
+            }         
+      len = strlen(input_buffer);
+      input_buffer[len-1]='\0';
+      strcpy(his_var, input_buffer);
+      if(strcmp(input_buffer, "exit") == 0) 
+            {
+              flag = 1;
+              break;
+            }
+      if(input_buffer[0]=='!')  
+              {
+                fileprocess();
+                bang_flag=1;
+                bang_execute();
+              }
+      waitpid(pid,&status,0);
+         
+    }  
+    if(flag==1)
+      {
+      printf("Bye...\n");
+      exit(0);       
+      return 0;
+      }
+return 0;
 }
