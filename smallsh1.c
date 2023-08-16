@@ -142,7 +142,7 @@ void handle_SIGTSTP() {
 int getCommands(char* args) {
 	int i, num_args = 0;
 	char tempString [MAX_CMD_LEN];
-	printf(": ");
+	printf("$ ");
 	fflush(stdout);
 	fgets(args, MAX_CMD_LEN, stdin);
 	strtok(args, "\n");
