@@ -1,9 +1,9 @@
-/**************************************************************
- * *  Filename: smallsh.c
- * *  Coded by: Kevin To
- * *  Purpose - Implementation of a shell.
- * *
- * ***************************************************************/
+/* Martin Barker 2017
+*	 This program executes a simple shell in c
+* The shell can run background proccesses, command line arguments, and
+* perform I/O redirection.
+* The shell uses fork(), exec(), and waitpid() to execute commands.
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,642 +11,434 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <termios.h>
 
-#define MAX_ARGS 513 // This is 513 because we support 512 arguments plus 1 command
-#define MAX_COMMAND_LENGTH 2048 
-#define MAX_ERR_MSG_LENGTH 80 
+int pidarray[1000];
+int pidarraycount;
+int numpids;
+int exitstatus;
+int lastforeground;
+int pidskilled;
+int skip;
+int ignored;
+static volatile int keeprunning = 1;
 
-// Function declarations
-void RunShellLoop();
-void RemoveNewLineAndAddNullTerm(char *stringValue);
-int RunForeGroundCommand(char *userCommand, char *errMsg);
-void ParseUserInputToArgs(char *userCommand, char **returnArr);
-void InitializeArgsArray(char **argv);
-int ContainsString(char *stringToSearch, char *stringToSearchFor);
-void GetFileName(char *userCommand, char *returnValue);
-int RunBackGroundCommand(char *userCommand);
-static void sigchld_handler (int sig);
+struct LinkedList{
+	int data;
+	struct LinkedList *next;
+};
+typedef struct LinkedList *node;
 
-/**************************************************************
- * * Entry:
- * *  N/a
- * *
- * * Exit:
- * *  N/a
- * *
- * * Purpose:
- * *	This is the entry point into the program.
- * *
- * ***************************************************************/
-int main()
-{
-	// Set up a signal handler to deal with signals from child processes
-	struct sigaction act;
-	act.sa_handler = sigchld_handler;
-	sigaction(SIGCHLD, &act, NULL);
 
-	// Run the small shell loop
-	RunShellLoop();
-
-	return 0;
+//reads input of a string of unknown lengh and returns char array
+char *inputString(FILE* fp, size_t size){
+	char *str;
+	int ch;
+	size_t len = 0;
+	str = realloc(NULL, sizeof(char)*size);
+	if(!str)return str;
+	while(EOF!=(ch=fgetc(fp)) && ch != '\n'){
+		str[len++]=ch;
+		if(len==size){
+			str = realloc(str, sizeof(char)*(size+=16));
+			if(!str)return str;
+		}
+	}
+	str[len++]='\0';
+	return realloc(str, sizeof(char)*len);
 }
 
-/**************************************************************
- * * Entry:
- * *  N/a
- * *
- * * Exit:
- * *  N/a
- * *
- * * Purpose:
- * *	Runs the shell loop
- * *
- * ***************************************************************/
-void RunShellLoop()
-{
-	int exitShell = 0;
-	int statusNumber = 0;
-	char userInput[MAX_COMMAND_LENGTH] = "";
+//catches ctrl-c process termination
+void myhandler(int dummy) {
+	printf("terminated by signal %d\n", dummy);
+}
 
-	char errMsg[MAX_ERR_MSG_LENGTH] = "";
+//catches ctrl-z termination, switches over to background mode/normal mode
+void myzhandler(int dummy){
+	if(ignored == 0){
+		printf("Entering foreground-only mode (& is now ignored)\n");
+		ignored = 1;
+	}else if(ignored == 1){
+		printf("Exiting foreground-only mode\n");
+		ignored = 0;
+	}
+}
 
-	while (exitShell == 0)
-	{
-		// Clear stdin
-		tcflush(0, TCIFLUSH);
+int main(){
+	//handles sending ctrl-z ctrl-c
+	ignored = 0;
+	struct sigaction sigih;
+	sigih.sa_handler = myhandler;
+	sigemptyset(&sigih.sa_mask);
+	sigih.sa_flags = 0;
+	sigaction(SIGINT, &sigih, NULL);
+	sigih.sa_handler = myzhandler;
+	sigemptyset(&sigih.sa_mask);
+	sigih.sa_flags = 0;
+	sigaction(SIGTSTP, &sigih, NULL);
 
-		// Clear the user input variable before each run
-		strncpy(userInput, "", MAX_COMMAND_LENGTH - 1);
 
+	//will keep track of background proccesses
+	pidskilled = 0;
+	pidarraycount = 0;
+	char *line;
+	char *backup;
+	int exitv = 0;
+	int exitsignal = 0;
+	int terminatedby = 0;
+/*
+ *	while loop for user input
+ */
+	while(exitv == 0){
+		skip = 0;
+
+		//check pidarray, if proccess has been terminated print PID
+		int j = 0;
+		int status2;
+
+		/*
+ 		*	if there are pids in pidarray, loop through to print out any ones that have exited
+ 		*/
+		if(numpids > 0){
+			for(j = 0; j < pidarraycount; j++){
+				pid_t result = waitpid(pidarray[j], &status2, WNOHANG);
+				if(pidarray[j] != 0){
+					if(result != 0){
+						//proccess is done, kill and remove from array
+						printf("background pid %d is done: exit value %d\n", result, status2);
+						kill(pidarray[j], SIGKILL);
+						pidskilled++;
+						pidarray[j] = 0;
+					}
+
+				}
+			}
+		}
+		printf(":");   //start of shell
+/*
+ *  sends stdin to function where it returns the input as a char arrayof the correct size
+*/
+		line = inputString(stdin, 10);
+		fflush(stdin);
 		fflush(stdout);
-    	
-    // Get user input
-		printf(": ");
-		fgets(userInput, 79, stdin);
-		fflush(stdout);
-		RemoveNewLineAndAddNullTerm(userInput);
-
-		// If you at the end of an input file, then exit.
-		if (feof(stdin))
-		{
-			exit(0);
+/*
+ * parses line into different things, such as first word, first 6 chars, last letter, etc
+ */
+		if(strcmp("exit $", line)==0){
+			exitv++;
 		}
 
-		// Restart loop if user entered nothing
-		if (strcmp(userInput, "") == 0)
-		{
-			continue;
+		int L1 = strstr(line, "$$")-line;
+		int L2 = (strstr(line, "$$")-line)+1;
+
+		if(L1 > 0 && L2 > 0){
+			line[L1] = '%';
+			line[L2] = 'd';
+			char expandinput[200];
+			sprintf(expandinput, line, getpid());
+			strncpy(line, expandinput, 50);
 		}
 
-		// Restart the loop if the user entered a comment
-		if (userInput[0] == '#')
-		{
-			continue;
+//parses line for individual strings / any special chars
+		char firstLetter[1];
+		char temp = line[0];
+		firstLetter[0] = temp;
+		firstLetter[1] = '\0';
+		char firstTwoLetters[2] = "  ";
+		if(strlen(line) >= 2){
+			firstTwoLetters[0] = line[0];
+			firstTwoLetters[1] = line[1];
+			firstTwoLetters[2] = '\0';
 		}
-
-		// Exit the shell if user wants us to
-		if (strcmp(userInput, "exit") == 0)
-		{
-			exitShell = 1;
-			exit(0);
+		char * space;
+		int spaces = 1;
+		char * spaceCount;
+		space=strchr(line, ' ');
+		spaceCount=strchr(line, ' ');
+		char lastletter[2] = "  ";
+		int lastSpaceCount = 0;
+		while (spaceCount!=NULL){
+				spaces++;
+				lastSpaceCount = spaceCount-line;
+				spaceCount=strchr(spaceCount+1, ' ');
 		}
-
-		// Change the current shell's directory to HOME if the 
-		// user types "cd"
-		if (strcmp(userInput, "cd") == 0)
-		{
-			// Get the HOME path
-			char* homePath;
-  		homePath = getenv("HOME");
-
-  		// Change the current directory
-			chdir(homePath);
-			continue;
+		lastletter[1] = '\0';
+		memcpy(lastletter, &line[strlen(line)-1], lastSpaceCount);
+		char linearray[spaces+1][200];
+		spaceCount=strchr(line, ' ');
+		spaces = 0;
+		lastSpaceCount = 0;
+		int prev = 0;
+		char indv[1024];
+		while (spaceCount!=NULL){
+			lastSpaceCount = spaceCount-line;
+			indv[1024];
+			memcpy(indv, &line[prev], lastSpaceCount);
+			indv[lastSpaceCount - prev] = '\0';
+			strcpy(linearray[spaces], indv);
+			prev = lastSpaceCount +1;
+			spaces++;
+			spaceCount=strchr(spaceCount+1, ' ');
 		}
-
-		// Change current directory to user specified directory
-		if ((userInput[0] == 'c') && (userInput[1] == 'd') && (userInput[2] == ' '))
-		{
-			char *argArr[MAX_ARGS];
-			InitializeArgsArray(argArr);
-
-			// Get the directory name from the user entered command
-			ParseUserInputToArgs(userInput, argArr);
-
-			// Change the current directory
-			chdir(argArr[1]);
-			continue;
+		memcpy(indv, &line[prev], strlen(line));
+		indv[strlen(line) - prev] = '\0';
+		strcpy(linearray[spaces], indv);
+		int i = 0;
+		char *args2[spaces+1];
+		for(i=0; i <= spaces; i++){
+			args2[i] = linearray[i];
 		}
-
-		// Get the status of the previous command
-		if (strcmp(userInput, "status") == 0)
-		{
-			if (strncmp(errMsg, "", MAX_ERR_MSG_LENGTH) == 0)
-			{
-				// Display the regular status output
-				printf("exit value %d\n", statusNumber);
+		args2[spaces+1] = NULL;
+		char firstword[2];
+		if(space-line > 0){
+			firstword[space-line];
+			memcpy(firstword, &line[0], space-line);
+			firstword[space-line] = '\0';
+		}
+		char firstSix[6] = "      ";
+		if(strlen(line) >= 6){
+			memcpy(firstSix, &line[3], strlen(line));
+		}
+/*
+ * detects if the user input is a built in command
+ */
+		if(strcmp(line, "exit")==0){
+			exitv++;
+		}else if(strcmp(firstTwoLetters, "cd")==0){
+			if(strlen(line) == 2){
+				const char* s = getenv("HOME");
+				chdir(s);
+			}else{
+				char dir[strlen(line)-3];
+				memcpy(dir, &line[3], strlen(line));
+				chdir(dir);
 			}
-			else
-			{
-				// If there was an error message, then show that instead of the 
-				//  regular status message
-				printf("%s\n", errMsg);
+		}else if(strcmp(args2[0], "status")==0){
+			if(lastforeground != 1){
+				printf("exit value %d\n", exitstatus);
+			}else{
+				printf("terminated by signal %d\n", terminatedby);
 			}
+		}else if(strcmp(firstLetter, "#")!=0){
 
-			// Clear the status
-			strncpy(errMsg, "", MAX_ERR_MSG_LENGTH);
-			statusNumber = 0;
-			continue;
-		}
-		else
-		{
-			// Clean up the status if we didn't want to display it
-			strncpy(errMsg, "", MAX_ERR_MSG_LENGTH);
-			statusNumber = 0;
-		}
+//if input = not build in:
+// determine any input / output redirection to be done
+/*
+ *	find i_place (where < occurs" and o_place (where > occurs)
+ */
 
-		// Check if we are doing a background process
-		if (ContainsString(userInput, "&"))
-		{
-			RunBackGroundCommand(userInput);
-			continue;
-		}
-		
-		// Run the foreground command	
-		statusNumber = RunForeGroundCommand(userInput, errMsg);
-	}
-}
-
-/**************************************************************
- * * Entry:
- * *  userCommand - the user entered command string
- * *
- * * Exit:
- * *  Returns 0, if command executed without errors.
- * *  Returns any other number, if command executed with errors.
- * *
- * * Purpose:
- * *	Runs the specified foreground command.
- * *
- * ***************************************************************/
-int RunBackGroundCommand(char *userCommand)
-{	
-	int returnStatus = 0;
-	pid_t spawnPid = -5;
-	char pidNumberStr[10];
-	int fd = -1;
-	char fileName[MAX_COMMAND_LENGTH] = "";
-
-	// Check if we have any redirects
-	int hasOutputRedirect = ContainsString(userCommand, ">");
-	int hasInputRedirect = ContainsString(userCommand, "<");
-
-	char *argv[MAX_ARGS];
-	InitializeArgsArray(argv);
-
-	// Get the file descriptor if we have to redirect output
-	if (hasOutputRedirect == 1)
-	{
-		GetFileName(userCommand, fileName);
-		fd = open(fileName, O_WRONLY|O_TRUNC|O_CREAT, 0644);
-	}
-
-	// Get the file descriptor if we have to redirect input 
-	if (hasInputRedirect == 1)
-	{
-		GetFileName(userCommand, fileName);
-		fd = open(fileName, O_RDONLY, 0644);
-	}
-	else
-	{
-		// Redirect stdin to dev/null if the user did not 
-		//  specify input redirection
-		fd = open("/dev/null", O_RDONLY);
-	}
-
-	// Get the args from the user entered string
-	ParseUserInputToArgs(userCommand, argv);
-
-	// Start the child process for command execution	
-	spawnPid = fork();
-
-	switch (spawnPid)
-	{
-		case -1:
-			// Error in forking, exit.
-			exit(1);
-			break;
-		case 0:
-			// This code will be executed by the child process.
-
-			if ((hasOutputRedirect) && (dup2(fd, 1) < 0))
-			{ 
-				// Establish the std output redirect, exit if error is found.
-				exit(1);
+			i = 0;
+			int i_place = 0;
+			int o_file = 0;
+			int o_place = 0;
+			int OS_string_end = 0;
+			for(i=0; i<= spaces; i++){
+				if(strcmp(args2[i], "<")==0){
+					i_place = i;
+				}else if(strcmp(args2[i], ">")==0){
+					o_place = i;
+					o_file = i+1;
+				}
 			}
-			else if ((dup2(fd, 0) < 0))
-			{ 
-				// Establish the std input redirect, exit if error is found.
-				printf("smallsh: cannot open %s for input\n", fileName);
-				exit(1);
+//creates and fill os_string
+			spaces++;
+			char *OS_string[spaces];
+			i = 0;
+			for(i=0; i < spaces; i++){
+				OS_string[i] = args2[i];
 			}
+			char *command = OS_string[0];
+			char *s;
+			char *t;
+//does i/o redirection if needed
+			int sourceFD = 0;
+			int targetFD = 0;
+			int result = 0;
+			int stat = 0;
+			if(i_place != 0){
 
-   	 		close(fd);
+				if(access(OS_string[i_place+1], F_OK)!= -1){
+				}else{
+					printf("cannot open %s for input\n", OS_string[i_place+1]);
+					skip = 1;
+				}
 
-   	 		// Execute the user's command
-	  		execvp(argv[0], argv);
-	  		printf("%s: no such file or directory\n", argv[0]);
-	  		exit(1);
-			break;
-		default:
-			// This code will be run by the parent process.
+				stat = 1;
+				sourceFD = open(OS_string[i_place+1], O_RDONLY);
+				OS_string_end = i_place;
+				if(o_place != 0){
+					stat = 2;
+					targetFD = open(OS_string[o_place+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				}
+			}else{
+				if(o_place == 0 && i_place == 0){
+					stat = 3;
+				}else{
+		    	if(o_place != 0){
+						stat = 4;
+			     			targetFD = open(OS_string[o_place+1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+					}
+				}
+			}
+/*
+ * targetfd and sourcefd have been set depending on if string has input, output, both, or a combination (does not acount for & background proccesses)
+ */
+			int size = 0;
+			if(i_place != 0 && o_place != 0){
+				size = i_place;  //input and output
+			}else{
+				if(i_place != 0 && o_place == 0){
+					size = i_place; //input and no output
+				}else if(i_place == 0 && o_place != 0){
+					size = o_place; //only output
+				}else if(i_place == 0 && o_place == 0){
+					size = spaces;
+				}
+			}
+			int background = 0;
 
-			close(fd);
-
-			// Output the process ID message for background processes
-			snprintf(pidNumberStr, sizeof(pidNumberStr), "%d", spawnPid);
-			printf("background pid is %s\n", pidNumberStr);
-
-			break;
-	}
-
-	return returnStatus;
-}
-
-/**************************************************************
- * * Entry:
- * *  sig - the signal number
- * *
- * * Exit:
- * *  n/a
- * *
- * * Purpose:
- * *	Is the signal hander for any child signals
- * *
- * ***************************************************************/
-static void sigchld_handler (int sig)
-{
-	int status;
-	pid_t childPid;
-
-	// Close all zombie child processes by waiting for it.
-	while ((childPid = waitpid(-1, &status, WNOHANG)) > 0)
-	{
-		// Convert the child pid to a string
-		char pidNumberStr[10];
-		snprintf(pidNumberStr, sizeof(pidNumberStr), "%d", childPid);
-
-		// Declare the message variable
-		char childTerminateMsg[MAX_ERR_MSG_LENGTH]; 
-
-		// Construct the child terminate message
-		//  Example: "background pid 4923 is done: exit value 0"
-		strncpy(childTerminateMsg, "\nbackground pid ", MAX_ERR_MSG_LENGTH);
-		strcat(childTerminateMsg, pidNumberStr);
-		strcat(childTerminateMsg, " is done: ");
-	
-		// If child was terminated by a signal, then display the correct message	
-		if(WIFSIGNALED(status)) {
-				int signalNumber = WTERMSIG(status);
-				char signalNumberStr[10];
-   			snprintf(signalNumberStr, sizeof(signalNumberStr), "%d", signalNumber); // Convert signal number to a string
-
-   			// Output the correct error message and save it for the status command
-				strcat(childTerminateMsg, "terminated by signal ");
-				strcat(childTerminateMsg, signalNumberStr);
-				strcat(childTerminateMsg, "\n");
-				write(1, childTerminateMsg, sizeof(childTerminateMsg));
-		}
-		else
-		{
-			// Child exited normally, write out the normal child process end message
-			char statusNumberStr[5];
-			strcat(childTerminateMsg, "exit value ");
-			snprintf(statusNumberStr, sizeof(statusNumberStr), "%d", WEXITSTATUS(status)); // Convert status number to a string
-			strcat(childTerminateMsg, statusNumberStr);
-			strcat(childTerminateMsg, "\n");
-
-			// Write out the message
-			write(1, childTerminateMsg, sizeof(childTerminateMsg));
-		}
-
-		continue;
-	}
-}
-
-/**************************************************************
- * * Entry:
- * *  userCommand - the user entered command string
- * *  errMsg - the return variable to hold the error message
- * *
- * * Exit:
- * *  Returns 0, if command executed without errors.
- * *  Returns any other number, if command executed with errors.
- * *
- * * Purpose:
- * *	Runs the specified foreground command.
- * *
- * ***************************************************************/
-int RunForeGroundCommand(char *userCommand, char *errMsg)
-{	
-	int status = 0;
-	int returnStatus = 0;
-	pid_t spawnPid = -5;
-	int fd = -1;
-	struct sigaction act;
-	char fileName[MAX_COMMAND_LENGTH] = "";
-
-	// Determine if we have any redirects
-	int hasOutputRedirect = ContainsString(userCommand, ">");
-	int hasInputRedirect = ContainsString(userCommand, "<");
-
-	char *argv[MAX_ARGS];
-	InitializeArgsArray(argv);
-
-	// Get the file descriptor if we have to redirect output
-	if (hasOutputRedirect == 1)
-	{
-		GetFileName(userCommand, fileName);
-		fd = open(fileName, O_WRONLY|O_TRUNC|O_CREAT, 0644);
-	}
-
-	// Get the file descriptor if we have to redirect input 
-	if (hasInputRedirect == 1)
-	{
-		GetFileName(userCommand, fileName);
-		fd = open(fileName, O_RDONLY, 0644);
-	}
-
-	// Get all the args from the user entered command
-	ParseUserInputToArgs(userCommand, argv);
-
-	// Start the child process for command execution	
-	spawnPid = fork();
-
-	switch (spawnPid)
-	{
-		case -1:
-			// Fork failed
-			exit(1);
-			break;
-		case 0:
-			// This code will run in the child process
-
-			// Establish the std output redirect, exit if error is found.
-			if ((hasOutputRedirect) && (dup2(fd, 1) < 0))
-			{ 
-				exit(1);
+/*
+ * sets background = 1 if last char in line is &, if it is background command; set input/output redirection to junk file
+ */
+			if(strcmp(OS_string[spaces-1], "&")==0){
+				if(ignored == 0){
+					background = 1;
+					numpids = numpids + 1;
+					targetFD = open("junktrashbackground", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+					if(stat == 3 || stat == 4){
+						sourceFD = open("junktrashbackground2", O_WRONLY);
+					}
+				}else if(ignored == 1){
+					background == 0;
+				}
 			}
 
-			// Establish the std input redirect, exit if error is found.
-			if ((hasInputRedirect) && (dup2(fd, 0) < 0))
-			{ 
-				printf("smallsh: cannot open %s for input\n", fileName);
-				exit(1);
+/*
+ * puts what will be executed in exevc command into array called exec_string
+ */
+			char *exec_string[size];
+			i = 0;
+			if(ignored == 1){
+				background = 1;
+			}
+			for(i=0; i < size-background; i++){
+				exec_string[i] = OS_string[i];
+			}
+			exec_string[size-background] = NULL;
+			if(ignored == 1){ background = 0; }
+			pid_t spawnpid = -5;
+			int childExitMethod = -5;
+			int ten = 10;
+			result = 0;
+			int backgroundpid = 99;
+			spawnpid = fork();
+			int spaces2 = 0;
+			if(skip == 1){
+				sourceFD = open("/dev/null", O_WRONLY);
 			}
 
-			// Set up the signal handler for the child process to not ignore termination signals
-			act.sa_handler = SIG_DFL;
-			sigaction(SIGINT, &act, NULL);
-
- 	 		close(fd);
-
-			// Try to execute the user command
-  		execvp(argv[0], argv);
-  		printf("%s: no such file or directory\n", argv[0]);
-  		exit(1);
-			break;
-		default:
-			// This code will run in the parent process
-
-			close(fd);
-			
-			// Set up the signal handler for the parent process to ignore termination messages
-			act.sa_handler = SIG_DFL;
-			act.sa_handler = SIG_IGN;
-			sigaction(SIGINT, &act, NULL);
-
-			// Wait for child process to finish	
-			waitpid(spawnPid, &status, 0);
-
-			returnStatus = WEXITSTATUS(status);
-
-			// Save the appropriate signal error message
-			if(WIFSIGNALED(status)) {
-				int signalNumber = WTERMSIG(status);
-				char terminateMsg[MAX_ERR_MSG_LENGTH]; 
-				char signalNumberStr[10];
-   				snprintf(signalNumberStr, sizeof(signalNumberStr), "%d", signalNumber);
-
-   			// Output the correct error message and save it for the status command
-				strncpy(terminateMsg, "terminated by signal ", MAX_ERR_MSG_LENGTH);
-				strcat(terminateMsg, signalNumberStr);
-				printf("%s\n", terminateMsg);
-				strncpy(errMsg, terminateMsg, MAX_ERR_MSG_LENGTH);
+//forks off
+			if(ignored == 1){
+				background == 0;
 			}
+			switch (spawnpid){
+				case -1:
+					perror("Hull Breach!");
+					exit(1);
+					exitsignal = 1;
+					break;
+				case 0:   //child case
 
-			break;
+				if(background==0){
+					spaces2 = spaces;
+					if(stat == 1){ //only input redirection
+						result = dup2(sourceFD, 0);
+						if(skip == 1){
+
+						}
+						if(result ==-1){
+							perror("source dup2()");
+							exitstatus = 1;
+						}
+					}
+					if(stat == 2){ //both i and o redirection
+						result = dup2(sourceFD, 0);
+						if(result ==-1){
+							perror("source dup2()");
+							exitstatus = 1;
+						}
+						result = dup2(targetFD, 1);
+						if(result ==-1){
+							perror("target dup2()");
+							exitstatus = 1;
+						}
+						OS_string[1] = NULL;
+						if(sourceFD == -1){
+							perror("source open()");
+							exitstatus = 1;
+						}
+						if(targetFD == -1){
+							perror("target open()");
+							exitstatus = 1;
+						}
+					}else if(stat == 3){ //single command
+
+					}else if(stat == 4){ //single output
+						result = dup2(targetFD, 1);
+						if(result ==-1){
+							perror("target dup2()");
+							exitstatus = 1;
+						}
+					}
+			}else if(background == 1){
+						result = dup2(targetFD, 1);
+						if(stat == 3 || stat == 4){
+							result = dup2(sourceFD, 0);
+						}
+
+					}
+/*
+ * dup2 i/o redirection is all successfully set now, run command
+ */
+					if(skip == 1){
+						execlp("echo", "echo", " ", NULL);
+					}else{
+
+					OS_string[spaces2] = NULL;
+					if(background==1){
+						fclose(stdin);
+						fopen("/dev/null", "r");
+						execvp(exec_string[0], exec_string);
+						exit(1);
+					}else{
+						execvp(exec_string[0], exec_string);
+						exit(1);
+					}
+				}
+					perror("CHILD: exec failure\n");
+					break;
+
+				default: //parent class
+					if(background == 1 ){
+						printf("background pid is %d\n", spawnpid);
+					}else if(background == 0){
+						waitpid(spawnpid, &childExitMethod, 0);
+						kill(spawnpid, SIGKILL);
+					}
+					break;
+			}
+			//outside of fork now
+			//wait for program to close, or dont wait if = background process &
+			if(background == 1){
+				pidarray[pidarraycount] = spawnpid;
+				pidarraycount=pidarraycount+1;
+			}
+			int exitStatus = WEXITSTATUS(childExitMethod);
+			exitstatus = exitStatus;
+			int termSignal = WTERMSIG(childExitMethod);
+
+		}
 	}
-
-	return returnStatus;
-}
-
-/**************************************************************
- * * Entry:
- * *  userCommand - the user entered command string
- * *  returnValue - the array containing the user entered commands.
- * *								used as a return container.
- * *
- * * Exit:
- * *  n/a
- * *
- * * Purpose:
- * *  Takes a user entered command string and breaks it up per word
- * *  and puts it into an array. We will not put the redirection 
- * *	symbols into the return array. We will also not put anything
- * *	after the redirection symbols into the return array.
- * *
- * ***************************************************************/
-void ParseUserInputToArgs(char *userCommand, char **returnArr)
-{
-  char *currentToken;
-  int currentTokenNumber = 0;
-
-  // Determine if we have any redirect symbols
-	int HasOutputRedirect = ContainsString(userCommand, ">");
-	int HasInputRedirect = ContainsString(userCommand, "<");
-
-  // Increment through the user command and break each word based on the 
-  //  whitespace delimiter. Put each word into the return array.
-  currentToken = strtok(userCommand, " ");
-  while (currentToken != NULL)
-  {
-  	// Break if we find an output redirect symbol
-  	if ((HasOutputRedirect == 1) && (strcmp(currentToken, ">") == 0))
-    {
-    	break;
-    }
-
-  	// Break if we find an input redirect symbol
-    if ((HasInputRedirect == 1) && (strcmp(currentToken, "<") == 0))
-    {
-    	break;
-    }
-
-    // Break if we find the background process symbol ("&")
-		if (strcmp(currentToken, "&") == 0)
-    {
-    	break;
-    }
-
-    // Add the command arg to the array
-  	returnArr[currentTokenNumber] = currentToken;
-    currentToken = strtok (NULL, " ");
-    currentTokenNumber++;
-
-    // Break out if we are reaching the array limit.
-    if (currentTokenNumber == (MAX_ARGS - 1))
-    {
-  		returnArr[MAX_ARGS - 1] = 0;
-    	break;
-    }
-  }
-
-  // Add the null terminator to the end of the array
-  returnArr[currentTokenNumber] = 0;
-}
-
-/**************************************************************
- * * Entry:
- * *  userCommand - the user entered command string
- * *  returnValue - the return value to hold the file name
- * *
- * * Exit:
- * *  n/a
- * *
- * * Purpose:
- * *  Gets the file name for the user entered command string. We
- * *  will only get a file name if there is a redirection symbol.
- * *
- * ***************************************************************/
-void GetFileName(char *userCommand, char *returnValue)
-{
-	// There are no redirects, so do not get the file name
-	if ((ContainsString(userCommand, "<") == 0) && (ContainsString(userCommand, ">") == 0)) 
-	{
-		return;
-	}
-
-	// Break all the commands into an array and find the first element
-	//  after the redirection signs
-	char *tempArray[MAX_ARGS];
-	char *currentToken;
-  int currentTokenNumber = 0;
-  int redirSymPosition = 0;
-
-  // Increment through the user command and break each word based on the 
-  //  whitespace delimiter. Put each word into the return array.
-  InitializeArgsArray(tempArray);
-  currentToken = strtok(userCommand, " ");
-  while (currentToken != NULL)
-  {
-  	// Save the position of redirect symbol
-  	if ((strcmp(currentToken, "<") == 0) || (strcmp(currentToken, ">") == 0))
-  	{
-  		redirSymPosition = currentTokenNumber;
-  	}
-
-    // Add the command arg to the array
-  	tempArray[currentTokenNumber] = currentToken;
-    currentToken = strtok (NULL, " ");
-    currentTokenNumber++;
-
-    // Break out if we are reaching the array limit.
-    if (currentTokenNumber == (MAX_ARGS - 1))
-    {
-  		tempArray[MAX_ARGS - 1] = 0;
-    	break;
-    }
-  }
-
-  // Get the file name and save it in the return variable
-  if (tempArray[redirSymPosition + 1] != 0)
-  {
-  	strncpy(returnValue, tempArray[redirSymPosition + 1], MAX_COMMAND_LENGTH);
-  }
-}
-
-/**************************************************************
- * * Entry:
- * *  argv - the array of strings
- * *
- * * Exit:
- * *  n/a
- * *
- * * Purpose:
- * *  Will set all the elements in the specified array to 0.
- * *
- * ***************************************************************/
-void InitializeArgsArray(char **argv)
-{
-	int i; 
-	for(i = 0; i < MAX_ARGS; i++)
-	{
-		// Initialize all values in the array to NULL
-		argv[i] = 0;
-	}
-}
-
-/**************************************************************
- * * Entry:
- * *  stringValue - the string you want to transform
- * *
- * * Exit:
- * *  n/a
- * *
- * * Purpose:
- * *  Removes the new line character from the string and adds a null
- * *  terminator in its place.
- * *
- * ***************************************************************/
-void RemoveNewLineAndAddNullTerm(char *stringValue)
-{
-   size_t ln = strlen(stringValue) - 1;
-   if (stringValue[ln] == '\n')
-   {
-      stringValue[ln] = '\0';
-   }
-}
-
-/**************************************************************
- * * Entry:
- * *  stringToSearch - The string to perform a search on.
- * *  stringToSearchFor - The string to search for.
- * *
- * * Exit:
- * *  Returns 1, if we found the string.
- * *  Returns 0, if we didn't find the string.
- * *
- * * Purpose:
- * *  To seach a string to see if contains another string.
- * *
- * ***************************************************************/
-int ContainsString(char *stringToSearch, char *stringToSearchFor)
-{
-  char *foundStringPointer;
-
-  // Search for the specified string
-  foundStringPointer = strstr(stringToSearch, stringToSearchFor); 
-
-  if (foundStringPointer == 0)
-  {
-  	return 0; // False, did not find the string.
-  }
-  else
-  {
-  	return 1; // True, found the string.
-  }
 }
